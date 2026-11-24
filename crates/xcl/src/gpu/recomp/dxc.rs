@@ -814,6 +814,12 @@ where
         MISSED.with(|m| m.set(true));
         return Err("DXIL not compiled yet".into());
     }
+    // inside `source_capped`: a miss over the cap is refused, not compiled (and not cached)
+    let cap = SOURCE_CAP.with(|c| c.get());
+    if !within_source_cap(src.len(), cap) {
+        REFUSED.with(|r| r.set(Some(r.get().map_or(src.len(), |n| n.max(src.len())))));
+        return Err(format!("{} B HLSL over the source cap of {} B: not compiled", src.len(), cap.unwrap_or(0)));
+    }
     counters.misses.fetch_add(1, Ordering::Relaxed);
     let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
@@ -886,6 +892,26 @@ pub fn compile_counts() -> (usize, usize) {
 thread_local! {
     static CACHED_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SOURCE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static REFUSED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a cache miss of `len` bytes of HLSL is compiled under a cap of `cap` bytes (None:
+/// no cap).
+pub fn within_source_cap(len: usize, cap: Option<usize>) -> bool {
+    cap.is_none_or(|cap| len <= cap)
+}
+
+/// Run `f` with cache misses whose HLSL is longer than `cap` bytes refused instead of compiled
+/// (`xcl shaders --precompile --max-source-mb`: the biggest programs held every compile thread
+/// until memory ran out, #1269); programs already in the cache are still returned. Returns
+/// `f`'s result and the length of the longest source refused, if any.
+pub fn source_capped<R>(cap: Option<usize>, f: impl FnOnce() -> R) -> (R, Option<usize>) {
+    let before = SOURCE_CAP.with(|c| c.replace(cap));
+    REFUSED.with(|r| r.set(None));
+    let r = f();
+    SOURCE_CAP.with(|c| c.set(before));
+    (r, REFUSED.with(|r| r.take()))
 }
 
 /// Run `f` without compiling: a program missing from the disk cache fails at once instead

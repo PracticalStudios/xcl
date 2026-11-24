@@ -898,7 +898,15 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
+        // a cache miss with more HLSL than this is refused, not compiled (#1269)
+        let max_source = match max_source_arg(args) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("xcl shaders: {e}");
+                return 2;
+            }
+        };
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), max_source, t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1326,7 +1334,22 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
+/// `--max-source-mb N` in bytes: None without the option; an error when N is missing or not a
+/// whole number of MB (an unparsed cap would silently run the pass without one).
+fn max_source_arg(args: &[String]) -> Result<Option<usize>, String> {
+    let Some(i) = args.iter().position(|a| a == "--max-source-mb") else { return Ok(None) };
+    match args.get(i + 1).map(|v| (v, v.parse::<usize>())) {
+        Some((_, Ok(mb))) => Ok(Some(mb.saturating_mul(1 << 20))),
+        Some((v, Err(_))) => Err(format!("--max-source-mb {v:?}: expected a whole number of MB")),
+        None => Err("--max-source-mb: expected a whole number of MB".into()),
+    }
+}
+
+/// `--max-source-mb N` (`max_source`, bytes): a program missing from the DXIL cache whose HLSL
+/// is longer is not compiled (`dxc::source_capped`) and is listed at the end; one already in the
+/// cache is still used. Off by default.
+#[allow(clippy::too_many_arguments)]
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, max_source: Option<usize>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1347,6 +1370,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
     }
+    // (program, HLSL bytes) refused by `--max-source-mb`
+    let refused: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
@@ -1385,14 +1410,18 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         done.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match recomp::dxc::source_capped(max_source, || recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows)) {
+                        (Ok(c), _) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
-                        Err(e) => {
+                        (Err(_), Some(len)) => {
+                            refused.lock().unwrap().push((name.to_string(), len));
+                            0
+                        }
+                        (Err(e), None) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
@@ -1429,10 +1458,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             continue;
                         }
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
-                                Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
-                                Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
-                                Err(e) => {
+                            match recomp::dxc::source_capped(max_source, || recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile)) {
+                                (Ok((_, true)), _) => cached.fetch_add(1, Ordering::Relaxed),
+                                (Ok(_), _) => compiled.fetch_add(1, Ordering::Relaxed),
+                                (Err(_), Some(len)) => {
+                                    refused.lock().unwrap().push((format!("{name} {profile}"), len));
+                                    0
+                                }
+                                (Err(e), None) => {
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
                                         g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or("")));
@@ -1450,12 +1483,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    let mut refused = refused.into_inner().unwrap();
     println!(
-        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
+        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}{}, time {:.1} s",
         compiled.into_inner(),
         cached.into_inner(),
         failed.into_inner(),
         skipped.into_inner(),
+        max_source.map(|cap| format!(", refused by --max-source-mb {} {}", cap >> 20, refused.len())).unwrap_or_default(),
         t0.elapsed().as_secs_f64()
     );
     if used.is_some() {
@@ -1471,6 +1506,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
+    }
+    refused.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (program, len) in &refused {
+        println!("  refused: {program}, HLSL {:.1} MB", *len as f64 / 1048576.0);
     }
     0
 }
