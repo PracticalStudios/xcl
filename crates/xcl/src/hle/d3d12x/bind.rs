@@ -383,6 +383,13 @@ fn record_groups(cap_bytes: u64, record_bytes: u64, split: u32) -> u32 {
     (cap_bytes / record_bytes.max(1)).min(65_535 / split.max(1) as u64) as u32
 }
 
+/// The ExecuteIndirects of a two-pass ExecuteIndirect of `max` commands, each of one command and
+/// followed by a UAV barrier on the records: (command, compute pass). Each command's compute pass
+/// writes its records from record 0, so the next one goes only after the mesh pass drew them.
+fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
+    (0..max).flat_map(|k| [(k, true), (k, false)])
+}
+
 /// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
@@ -482,14 +489,18 @@ unsafe fn bind_two_pass_stage(
 /// `stride`, `offset` (of the DispatchMesh argument), `split`, `cap` (groups with a record), and
 /// where the commands are (u2) and go (u3), in bytes. Each command goes out twice, for the compute
 /// pass and then (at `count · stride`) for the mesh pass, with at most `cap` groups, all in X:
-/// both passes find a group's record by `gid.x` alone.
+/// both passes find a group's record by `gid.x` alone. With a count buffer (u0 dword 7 set: the
+/// count at dword 8's byte offset in u4), the commands past its count get no groups: they are run
+/// one by one (`two_pass_steps`), so without one.
 pub(super) const SCALE_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
 RWByteAddressBuffer src : register(u2);
 RWByteAddressBuffer dst : register(u3);
+RWByteAddressBuffer cnt : register(u4);
 [numthreads(64, 1, 1)]
 void main(uint tid : SV_DispatchThreadID) {
     uint count = io.Load(0), stride = io.Load(4), offset = io.Load(8), split = io.Load(12), cap = io.Load(16);
     if (tid >= count) return;
+    uint live = io.Load(28) != 0u ? min(count, cnt.Load(io.Load(32))) : count;
     uint s = io.Load(20) + tid * stride, d = io.Load(24) + tid * stride, m = d + count * stride;
     for (uint i = 0u; i < stride; i += 4u) {
         uint w = src.Load(s + i);
@@ -498,7 +509,7 @@ void main(uint tid : SV_DispatchThreadID) {
     }
     uint3 g = src.Load3(s + offset);
     uint n = 0u;
-    if (g.x != 0u && g.y != 0u && g.z != 0u) {
+    if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
         n = min(g.x, cap);
         n = g.y > cap / n ? cap : n * g.y;
         n = g.z > cap / n ? cap : n * g.z;
@@ -569,17 +580,25 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
 /// it back to COMMON) and where the compute pass's commands are; the mesh pass's follow them.
 ///
 /// They are read through the memory window over them, as translated shaders read memory, not
-/// through the title's buffer: its state on the PC is the title's and not known here.
+/// through the title's buffer: its state on the PC is the title's and not known here. So is the
+/// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let commands = (max as u64).saturating_mul(stride as u64);
     super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
+    let count_va = match count {
+        Some(p) => {
+            super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
+            Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?)
+        }
+        None => None,
+    };
     let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
-    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
@@ -591,6 +610,9 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     list.SetComputeRootUnorderedAccessView(0, consts_va);
     list.SetComputeRootUnorderedAccessView(2, src_va);
     list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
+    if let Some(va) = count_va {
+        list.SetComputeRootUnorderedAccessView(4, va);
+    }
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     Ok((dst, dst_off))
@@ -670,6 +692,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pso = super::pso_async::resolve_wait(raw_pso);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
+    let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
@@ -689,15 +712,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
                 }
-                // the groups past the record buffer are dropped on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
+                let count = match (count_buf, count_at) {
+                    (0, _) => None,
+                    (_, Some(p)) => Some(p),
+                    _ => return Err("its count is not in a console buffer in unified memory".into()),
+                };
+                // the groups past the record buffer, and the commands past the count, are dropped
+                // on the GPU (`SCALE_ARGS_HLSL`)
+                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
                 let passes = (|| -> Result<(), String> {
-                    bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                    pc(this, msig.companion_dispatch, max, scaled.as_raw() as usize, at, count_buf, count_off);
-                    emit_uav_barrier(list, Some(&res_buf));
-                    bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, max, scaled.as_raw() as usize, at + commands as u64, count_buf, count_off);
-                    emit_uav_barrier(list, Some(&res_buf));
+                    for (k, compute) in two_pass_steps(max) {
+                        bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
+                        let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
+                        pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
+                        emit_uav_barrier(list, Some(&res_buf));
+                    }
                     Ok(())
                 })();
                 emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
@@ -2181,6 +2210,11 @@ void main(uint t : SV_GroupIndex) {
     /// `SCALE_ARGS_HLSL` on `commands` (dwords each, the DispatchMesh argument at dword 1):
     /// the compute pass's and the mesh pass's commands.
     fn scale_args(commands: &[[u32; 4]], split: u32, cap: u32) -> Option<(Vec<[u32; 4]>, Vec<[u32; 4]>)> {
+        scale_args_counted(commands, split, cap, None)
+    }
+
+    /// `scale_args` with a count buffer holding `count`
+    fn scale_args_counted(commands: &[[u32; 4]], split: u32, cap: u32, count: Option<u32>) -> Option<(Vec<[u32; 4]>, Vec<[u32; 4]>)> {
         use crate::gpu::recomp::runner;
         if runner::adapter().is_err() {
             runner::skip_test("no GPU");
@@ -2191,7 +2225,10 @@ void main(uint t : SV_GroupIndex) {
         let (src, dst) = (0u32, 256u32);
         let mut mem: Vec<u32> = commands.iter().flatten().copied().collect();
         mem.resize(64 + 2 * 4 * n, 0xDEAD);
-        let io = [n as u32, 16, 4, split, cap, src, dst];
+        // the count at dword 60 (u4 is the same memory in the runner)
+        assert!(4 * n <= 60);
+        mem[60] = count.unwrap_or(0);
+        let io = [n as u32, 16, 4, split, cap, src, dst, count.is_some() as u32, 240];
         let out = runner::dispatch(&dxil, [(n as u32).div_ceil(64), 1, 1], &io, &mem).unwrap();
         let cmd = |k: usize| [out[64 + 4 * k], out[65 + 4 * k], out[66 + 4 * k], out[67 + 4 * k]];
         Some(((0..n).map(cmd).collect(), (n..2 * n).map(cmd).collect()))
@@ -2248,5 +2285,125 @@ void main(uint t : SV_GroupIndex) {
             assert!(scratch_args(list, &dev, SCRATCH_BLOCK).is_ok());
         }
         forget(list);
+    }
+
+    #[test]
+    fn gpu_indirect_two_pass_commands_past_the_count_get_no_groups() {
+        let commands = [[1, 3, 1, 1], [2, 2, 1, 1], [3, 4, 1, 1]];
+        let Some((compute, mesh)) = scale_args_counted(&commands, 2, 1000, Some(2)) else { return };
+        assert_eq!(compute, [[1, 3, 1, 1], [2, 2, 1, 1], [3, 0, 1, 1]]);
+        assert_eq!(mesh, [[1, 6, 1, 1], [2, 4, 1, 1], [3, 0, 1, 1]]);
+        let Some((compute, _)) = scale_args_counted(&commands, 2, 1000, Some(7)) else { return };
+        assert_eq!(compute, [[1, 3, 1, 1], [2, 2, 1, 1], [3, 4, 1, 1]]);
+    }
+
+    /// Commands of one two-pass ExecuteIndirect run in `two_pass_steps` order on the GPU, with
+    /// stand-ins for the two passes: the "compute pass" writes each group's record (from record 0)
+    /// with its command's constant, the "mesh pass" copies the records it reads out by command.
+    #[test]
+    fn gpu_two_pass_indirect_commands_keep_their_own_records() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let src = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1)"
+cbuffer C : register(b0) { uint v; };
+RWByteAddressBuffer rec : register(u0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void cs(uint3 g : SV_GroupID) { rec.Store(g.x * 4u, v); }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)); }
+"#;
+        // (constant, groups) of each command
+        let commands = [(1u32, 3u32), (2, 2), (3, 4)];
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let cs = crate::gpu::recomp::dxc::compile(src, "cs", "cs_6_6", &[]).unwrap();
+            let ms = crate::gpu::recomp::dxc::compile(src, "ms", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &cs).unwrap();
+            let pso = |dxil: &[u8]| -> ID3D12PipelineState {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                dev.CreateComputePipelineState(&desc).unwrap()
+            };
+            let (pass1, pass2) = (pso(&cs), pso(&ms));
+            let args = [
+                D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 { Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 { RootParameterIndex: 0, DestOffsetIn32BitValues: 0, Num32BitValuesToSet: 1 } },
+                },
+                D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+            ];
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 16, NumArgumentDescs: 2, pArgumentDescs: args.as_ptr(), NodeMask: 0 }, &rs, &mut sig).unwrap();
+            let sig = sig.unwrap();
+            let buffer = |bytes: u64, cpu: bool| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let heap = if cpu {
+                    D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() }
+                } else {
+                    D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (indirect, rec, out) = (buffer(256, true), buffer(256, false), buffer(1024, true));
+            let map = |b: &ID3D12Resource| -> *mut u32 {
+                let mut p = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut p)).unwrap();
+                p as *mut u32
+            };
+            let (a, o) = (map(&indirect), map(&out));
+            for (k, &(v, x)) in commands.iter().enumerate() {
+                std::ptr::copy_nonoverlapping([v, x, 1, 1].as_ptr(), a.add(4 * k), 4);
+            }
+            std::ptr::write_bytes(o, 0, 256);
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pass1).unwrap();
+            emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(1, rec.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            for (k, compute) in two_pass_steps(commands.len() as u32) {
+                list.SetPipelineState(if compute { &pass1 } else { &pass2 });
+                list.ExecuteIndirect(&sig, 1, &indirect, k as u64 * 16, None::<&ID3D12Resource>, 0);
+                emit_uav_barrier(&list, Some(&rec));
+            }
+            emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 10_000).unwrap();
+            for &(v, x) in &commands {
+                let got: Vec<u32> = (0..x).map(|g| *o.add((v * 16 + g) as usize)).collect();
+                assert_eq!(got, vec![v; x as usize], "the records the mesh pass of command {v} read");
+            }
+            indirect.Unmap(0, None);
+            out.Unmap(0, None);
+        }
     }
 }
