@@ -39,7 +39,7 @@ Usage:
       --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact
           compute record with XCL's real root signature and static samplers.
       --precompile [--only vs|ps|ms|cs] [--max-source-mb N]: compiles every program into the
-          DXIL cache; --max-source-mb skips a program not cached yet whose HLSL is over N MB.
+          DXIL cache; skips a program not cached yet whose HLSL is over N MB (8; 0: no limit).
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.

@@ -1334,11 +1334,13 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-/// `--max-source-mb N` in bytes: None without the option; an error when N is missing or not a
-/// whole number of MB (an unparsed cap would silently run the pass without one).
+/// `--max-source-mb N` in bytes: 8 MB without the option (where `dxc` switches to -O0), None
+/// (no cap) for 0; an error when N is missing or not a whole number of MB (an unparsed cap
+/// would silently run the pass without one).
 fn max_source_arg(args: &[String]) -> Result<Option<usize>, String> {
-    let Some(i) = args.iter().position(|a| a == "--max-source-mb") else { return Ok(None) };
+    let Some(i) = args.iter().position(|a| a == "--max-source-mb") else { return Ok(Some(8 << 20)) };
     match args.get(i + 1).map(|v| (v, v.parse::<usize>())) {
+        Some((_, Ok(0))) => Ok(None),
         Some((_, Ok(mb))) => Ok(Some(mb.saturating_mul(1 << 20))),
         Some((v, Err(_))) => Err(format!("--max-source-mb {v:?}: expected a whole number of MB")),
         None => Err("--max-source-mb: expected a whole number of MB".into()),
@@ -1347,7 +1349,7 @@ fn max_source_arg(args: &[String]) -> Result<Option<usize>, String> {
 
 /// `--max-source-mb N` (`max_source`, bytes): a program missing from the DXIL cache whose HLSL
 /// is longer is not compiled (`dxc::source_capped`) and is listed at the end; one already in the
-/// cache is still used. Off by default.
+/// cache is still used. 8 MB by default, off with `--max-source-mb 0`.
 #[allow(clippy::too_many_arguments)]
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, max_source: Option<usize>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
@@ -1490,7 +1492,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         cached.into_inner(),
         failed.into_inner(),
         skipped.into_inner(),
-        max_source.map(|cap| format!(", refused by --max-source-mb {} {}", cap >> 20, refused.len())).unwrap_or_default(),
+        max_source.map(|cap| format!(", refused over the {} MB source cap (--max-source-mb) {}", cap >> 20, refused.len())).unwrap_or_default(),
         t0.elapsed().as_secs_f64()
     );
     if used.is_some() {
@@ -2007,16 +2009,17 @@ mod tests {
     }
 
     #[test]
-    fn max_source_mb_without_the_option_is_off() {
-        assert_eq!(max_source_arg(&args(&[])), Ok(None));
-        assert_eq!(max_source_arg(&args(&["--precompile", "--only", "cs"])), Ok(None));
+    fn max_source_mb_without_the_option_is_8_mb() {
+        assert_eq!(max_source_arg(&args(&[])), Ok(Some(8 << 20)));
+        assert_eq!(max_source_arg(&args(&["--precompile", "--only", "cs"])), Ok(Some(8 << 20)));
     }
 
     #[test]
     fn max_source_mb_converts_whole_megabytes_to_bytes() {
         assert_eq!(max_source_arg(&args(&["--max-source-mb", "8"])), Ok(Some(8 << 20)));
         assert_eq!(max_source_arg(&args(&["--precompile", "--max-source-mb", "8", "--only", "cs"])), Ok(Some(8 << 20)));
-        assert_eq!(max_source_arg(&args(&["--max-source-mb", "0"])), Ok(Some(0)));
+        // 0 turns the cap off
+        assert_eq!(max_source_arg(&args(&["--max-source-mb", "0"])), Ok(None));
         // a value too big for bytes saturates, no overflow panic
         assert_eq!(max_source_arg(&args(&["--max-source-mb", &usize::MAX.to_string()])), Ok(Some(usize::MAX)));
     }
