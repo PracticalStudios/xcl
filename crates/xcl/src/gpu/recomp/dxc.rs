@@ -1291,4 +1291,136 @@ mod cache_tests {
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
     }
+
+    #[test]
+    fn source_cap_boundaries() {
+        assert!(within_source_cap(0, None));
+        assert!(within_source_cap(usize::MAX, None));
+        assert!(within_source_cap(10, Some(10)));
+        assert!(!within_source_cap(11, Some(10)));
+        assert!(within_source_cap(9, Some(10)));
+        assert!(within_source_cap(0, Some(0)));
+        assert!(!within_source_cap(1, Some(0)));
+    }
+
+    fn capped_request(dir: &Path, src: &str, counters: &CacheCounters, calls: &AtomicUsize) -> Result<(Vec<u8>, bool), String> {
+        compile_cached_in_observed(dir, src, "main", "cs_6_6", counters, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(synthetic_dxil(9))
+        })
+    }
+
+    fn capped_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-cap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_miss_over_the_source_cap_is_refused_and_not_cached() {
+        let dir = capped_dir("refuse");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let src = "x".repeat(100);
+        let (r, refused) = source_capped(Some(99), || capped_request(&dir, &src, &counters, &calls));
+        let error = r.unwrap_err();
+        assert!(error.contains("over the source cap"), "{error}");
+        assert_eq!(refused, Some(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.snapshot(), CacheStats::default());
+        let written = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(written, 0, "a refused source must leave no .dxil behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_oversized_source_already_cached_is_still_returned() {
+        let dir = capped_dir("hit");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let src = "y".repeat(100);
+        assert!(!capped_request(&dir, &src, &counters, &calls).unwrap().1);
+        let (r, refused) = source_capped(Some(10), || capped_request(&dir, &src, &counters, &calls));
+        assert_eq!(r.unwrap(), (synthetic_dxil(9), true));
+        assert_eq!(refused, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_miss_at_or_under_the_source_cap_compiles() {
+        let dir = capped_dir("under");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let (r, refused) = source_capped(Some(100), || capped_request(&dir, &"a".repeat(100), &counters, &calls));
+        assert_eq!(r.unwrap(), (synthetic_dxil(9), false));
+        assert_eq!(refused, None);
+        let (r, refused) = source_capped(Some(100), || capped_request(&dir, &"b".repeat(40), &counters, &calls));
+        assert!(r.is_ok());
+        assert_eq!(refused, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zero_cap_refuses_every_non_empty_miss() {
+        let dir = capped_dir("zero");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let (r, refused) = source_capped(Some(0), || capped_request(&dir, "z", &counters, &calls));
+        assert!(r.unwrap_err().contains("over the source cap"));
+        assert_eq!(refused, Some(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refusals_report_the_longest_source_and_start_afresh_each_call() {
+        let dir = capped_dir("longest");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let ((a, b), refused) = source_capped(Some(5), || {
+            (
+                capped_request(&dir, &"1".repeat(50), &counters, &calls),
+                capped_request(&dir, &"2".repeat(20), &counters, &calls),
+            )
+        });
+        assert!(a.is_err() && b.is_err());
+        assert_eq!(refused, Some(50));
+        // the shorter one last must not lower it; the next call must not inherit it
+        let (r, refused) = source_capped(Some(5), || capped_request(&dir, &"3".repeat(30), &counters, &calls));
+        assert!(r.is_err());
+        assert_eq!(refused, Some(30));
+        let (r, refused) = source_capped(Some(5), || capped_request(&dir, "ok", &counters, &calls));
+        assert!(r.is_ok());
+        assert_eq!(refused, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_source_cap_ends_with_source_capped_and_nests() {
+        let dir = capped_dir("scope");
+        let (counters, calls) = (CacheCounters::default(), AtomicUsize::new(0));
+        let big = "q".repeat(100);
+        let ((), _) = source_capped(Some(10), || ());
+        assert!(capped_request(&dir, &big, &counters, &calls).is_ok(), "the cap outlived source_capped");
+
+        let ((inner, outer_after), outer_refused) = source_capped(Some(10), || {
+            let (inner, inner_refused) = source_capped(Some(1000), || capped_request(&dir, &"w".repeat(200), &counters, &calls));
+            assert_eq!(inner_refused, None);
+            (inner, capped_request(&dir, &"e".repeat(60), &counters, &calls))
+        });
+        assert!(inner.is_ok());
+        assert!(outer_after.unwrap_err().contains("over the source cap"), "the outer cap was not restored");
+        assert_eq!(outer_refused, Some(60));
+
+        // `None` inside a cap lifts it for the inner call only
+        let ((inner, outer_after), _) = source_capped(Some(10), || {
+            let (inner, refused) = source_capped(None, || capped_request(&dir, &"r".repeat(300), &counters, &calls));
+            assert_eq!(refused, None);
+            (inner, capped_request(&dir, &"t".repeat(70), &counters, &calls))
+        });
+        assert!(inner.is_ok() && outer_after.is_err());
+
+        // `None` outside any cap changes nothing
+        let (r, refused) = source_capped(None, || capped_request(&dir, &"u".repeat(400), &counters, &calls));
+        assert!(r.is_ok());
+        assert_eq!(refused, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

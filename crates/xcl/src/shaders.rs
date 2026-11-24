@@ -2001,6 +2001,53 @@ mod tests {
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
     }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn max_source_mb_without_the_option_is_off() {
+        assert_eq!(max_source_arg(&args(&[])), Ok(None));
+        assert_eq!(max_source_arg(&args(&["--precompile", "--only", "cs"])), Ok(None));
+    }
+
+    #[test]
+    fn max_source_mb_converts_whole_megabytes_to_bytes() {
+        assert_eq!(max_source_arg(&args(&["--max-source-mb", "8"])), Ok(Some(8 << 20)));
+        assert_eq!(max_source_arg(&args(&["--precompile", "--max-source-mb", "8", "--only", "cs"])), Ok(Some(8 << 20)));
+        assert_eq!(max_source_arg(&args(&["--max-source-mb", "0"])), Ok(Some(0)));
+        // a value too big for bytes saturates, no overflow panic
+        assert_eq!(max_source_arg(&args(&["--max-source-mb", &usize::MAX.to_string()])), Ok(Some(usize::MAX)));
+    }
+
+    #[test]
+    fn max_source_mb_refuses_a_value_that_is_not_a_whole_number() {
+        let e = max_source_arg(&args(&["--max-source-mb", "8MB"])).unwrap_err();
+        assert!(e.contains("--max-source-mb") && e.contains("\"8MB\""), "{e}");
+        for bad in ["8.5", "-1", "", " 8"] {
+            let r = max_source_arg(&args(&["--max-source-mb", bad]));
+            assert!(r.is_err(), "{bad:?} gave {r:?}");
+        }
+    }
+
+    #[test]
+    fn max_source_mb_needs_a_value() {
+        assert_eq!(
+            max_source_arg(&args(&["--precompile", "--max-source-mb"])),
+            Err("--max-source-mb: expected a whole number of MB".to_string())
+        );
+        // a following flag is not taken as the value silently
+        let e = max_source_arg(&args(&["--max-source-mb", "--only", "cs"])).unwrap_err();
+        assert!(e.contains("--only"), "{e}");
+    }
+
+    #[test]
+    fn only_the_first_max_source_mb_is_read() {
+        assert_eq!(max_source_arg(&args(&["--max-source-mb", "2", "--max-source-mb", "9"])), Ok(Some(2 << 20)));
+        // a bad first one is not rescued by a good later one
+        assert!(max_source_arg(&args(&["--max-source-mb", "x", "--max-source-mb", "9"])).is_err());
+    }
 }
 
 /// `XCL_DUMP_HLSL=<folder>` (`--recomp`): every `XCL_DUMP_EVERY`-th complete translation (by a
