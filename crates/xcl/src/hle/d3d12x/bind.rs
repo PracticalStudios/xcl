@@ -461,7 +461,8 @@ unsafe fn bind_two_pass_stage(
 /// The pass that rewrites a two-pass ExecuteIndirect's arguments, on XCL's ABI: u0 = `count`,
 /// `stride`, `offset` (of the DispatchMesh argument), `split`, `cap` (groups with a record), and
 /// where the commands are (u2) and go (u3), in bytes. Each command goes out twice, for the compute
-/// pass and then (at `count · stride`) for the mesh pass, with at most `cap` groups.
+/// pass and then (at `count · stride`) for the mesh pass, with at most `cap` groups, all in X:
+/// both passes find a group's record by `gid.x` alone.
 pub(super) const SCALE_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
 RWByteAddressBuffer src : register(u2);
 RWByteAddressBuffer dst : register(u3);
@@ -475,9 +476,15 @@ void main(uint tid : SV_DispatchThreadID) {
         dst.Store(d + i, w);
         dst.Store(m + i, w);
     }
-    uint n = min(src.Load(s + offset), cap);
-    dst.Store(d + offset, n);
-    dst.Store(m + offset, n * split);
+    uint3 g = src.Load3(s + offset);
+    uint n = 0u;
+    if (g.x != 0u && g.y != 0u && g.z != 0u) {
+        n = min(g.x, cap);
+        n = g.y > cap / n ? cap : n * g.y;
+        n = g.z > cap / n ? cap : n * g.z;
+    }
+    dst.Store3(d + offset, uint3(n, 1u, 1u));
+    dst.Store3(m + offset, uint3(n * split, 1u, 1u));
 }
 "#;
 
@@ -537,7 +544,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     let raw_pso = with(this, |s| s.pso);
     let pso = super::pso_async::resolve_wait(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
-        let groups = x.saturating_mul(y.max(1)).saturating_mul(z.max(1));
+        let groups = x.saturating_mul(y).saturating_mul(z);
         if groups == 0 {
             return;
         }
@@ -2127,5 +2134,13 @@ void main(uint t : SV_GroupIndex) {
         let Some((compute, mesh)) = scale_args(&[[7, 100, 1, 1], [8, 3, 1, 1], [9, 0, 1, 1]], 2, 10) else { return };
         assert_eq!(compute, [[7, 10, 1, 1], [8, 3, 1, 1], [9, 0, 1, 1]]);
         assert_eq!(mesh, [[7, 20, 1, 1], [8, 6, 1, 1], [9, 0, 1, 1]]);
+    }
+
+    #[test]
+    fn gpu_indirect_two_pass_groups_go_in_x() {
+        let commands = [[1, 1, 2, 1], [2, 2, 3, 4], [3, 300, 300, 1], [4, 5, 0, 2], [5, 70_000, 70_000, 70_000]];
+        let Some((compute, mesh)) = scale_args(&commands, 3, 1000) else { return };
+        assert_eq!(compute, [[1, 2, 1, 1], [2, 24, 1, 1], [3, 1000, 1, 1], [4, 0, 1, 1], [5, 1000, 1, 1]]);
+        assert_eq!(mesh, [[1, 6, 1, 1], [2, 72, 1, 1], [3, 3000, 1, 1], [4, 0, 1, 1], [5, 3000, 1, 1]]);
     }
 }
