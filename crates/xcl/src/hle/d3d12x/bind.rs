@@ -36,7 +36,19 @@ struct State {
     arena: crate::gpu::uma::Arena,
     res_buf: Option<(ID3D12Resource, u64, usize)>,
     res_retired: Vec<(ID3D12Resource, u64, usize)>,
+    /// rewritten indirect arguments (`scratch_args`): the block, its bytes in use, and the
+    /// bytes of blocks this recording took
+    scratch: Option<(ID3D12Resource, u64, usize)>,
+    scratch_used: u64,
+    scratch_taken: u64,
 }
+
+/// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
+/// two-pass ExecuteIndirects are skipped)
+const SCRATCH_BLOCK: u64 = 1 << 20;
+const SCRATCH_CAP: u64 = 16 << 20;
+/// Most bytes of buffers kept for reuse (`FREE_RES`)
+const FREE_RES_CAP: u64 = 256 << 20;
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
@@ -52,10 +64,16 @@ pub(super) fn release_allocator_res(allocator: usize) {
     let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
     let mut free = FREE_RES.lock().unwrap();
     for b in bufs {
-        if free.len() < 16 {
+        let held: u64 = free.iter().map(|f| f.1).sum();
+        if pool_keeps(free.len(), held, b.1) {
             free.push(b);
         }
     }
+}
+
+/// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
+fn pool_keeps(count: usize, held: u64, bytes: u64) -> bool {
+    count < 16 && held + bytes <= FREE_RES_CAP
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -104,6 +122,8 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        // (the scratch blocks are in `res_retired` already)
+        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -508,34 +528,72 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     Ok((rs, pso))
 }
 
-/// The arguments of `max` commands at `src_off` in `src_raw`, rewritten for the two passes
-/// (`SCALE_ARGS_HLSL`): the buffer, with the compute pass's commands at 0 and the mesh pass's
-/// after them.
+/// `bytes` of this recording's scratch blocks (COMMON between uses): the block and the offset.
+/// Past `SCRATCH_CAP` a recording gets no more.
+unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64), String> {
+    let bytes = bytes.next_multiple_of(256);
+    if let Some(r) = with(this, |s| {
+        let (b, cap, _) = s.scratch.as_ref()?;
+        (s.scratch_used + bytes <= *cap).then(|| {
+            s.scratch_used += bytes;
+            (b.clone(), s.scratch_used - bytes)
+        })
+    }) {
+        return Ok(r);
+    }
+    let size = bytes.max(SCRATCH_BLOCK);
+    if with(this, |s| s.scratch_taken) + size > SCRATCH_CAP {
+        return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
+    }
+    let dev_key = dev.as_raw() as usize;
+    let picked = {
+        let mut free = FREE_RES.lock().unwrap();
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= SCRATCH_CAP).map(|i| free.swap_remove(i))
+    };
+    let block = match picked {
+        Some(e) => e,
+        None => (default_uav_buffer(dev, size, "two-pass argument scratch")?, size, dev_key),
+    };
+    let b = block.0.clone();
+    with(this, |s| {
+        s.scratch_taken += block.1;
+        s.scratch_used = bytes;
+        s.scratch = Some(block.clone());
+        s.res_retired.push(block);
+    });
+    Ok((b, 0))
+}
+
+/// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
+/// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
+/// it back to COMMON) and where the compute pass's commands are; the mesh pass's follow them.
+///
+/// They are read through the memory window over them, as translated shaders read memory, not
+/// through the title's buffer: its state on the PC is the title's and not known here.
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src_raw: usize, src_off: u64, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<ID3D12Resource, String> {
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let src_ptr = src_raw as *mut c_void;
-    let src = ID3D12Resource::from_raw_borrowed(&src_ptr).ok_or("indirect args buffer")?;
-    let bytes = (max as u64).saturating_mul(stride as u64).saturating_mul(2).max(256).next_multiple_of(256);
-    let dst = default_uav_buffer(&dev, bytes, "scaled args buffer")?;
+    let commands = (max as u64).saturating_mul(stride as u64);
+    super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
+    let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
+    let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
     let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
-    emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+    emit_uav_barrier(list, None);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
     list.SetComputeRootUnorderedAccessView(0, consts_va);
-    list.SetComputeRootUnorderedAccessView(2, src.GetGPUVirtualAddress() + src_off);
-    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
+    list.SetComputeRootUnorderedAccessView(2, src_va);
+    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    emit_transition(list, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    let dev_key = dev.as_raw() as usize;
-    with(this, |s| s.res_retired.push((dst.clone(), bytes, dev_key)));
-    Ok(dst)
+    Ok((dst, dst_off))
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -610,6 +668,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
     let pso = super::pso_async::resolve_wait(raw_pso);
+    // where the commands are in unified memory (a console buffer's offsets are the title's)
+    let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
@@ -618,6 +678,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if max == 0 || args == 0 {
                     return Ok(());
                 }
+                let commands = max as usize * msig.byte_stride as usize;
+                let src = match commands_at {
+                    Some((p, n)) if commands <= n => p,
+                    _ => return Err("its arguments are not in a console buffer in unified memory".into()),
+                };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let (res_buf, res_va, cap) = ensure_res_buffer(this, 32 << 20)?;
                 let cap = record_groups(cap, record_bytes, tp.mesh_groups_per_record);
@@ -625,15 +690,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
                 }
                 // the groups past the record buffer are dropped on the GPU (`SCALE_ARGS_HLSL`)
-                let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
-                let mesh_args = max as u64 * msig.byte_stride as u64;
-                bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                pc(this, msig.companion_dispatch, max, scaled.as_raw() as usize, 0, count_buf, count_off);
-                emit_uav_barrier(list, Some(&res_buf));
-                bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                pc(this, sig, max, scaled.as_raw() as usize, mesh_args, count_buf, count_off);
-                emit_uav_barrier(list, Some(&res_buf));
-                Ok(())
+                let (scaled, at) = make_scaled_args_buffer(this, list, src, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
+                let passes = (|| -> Result<(), String> {
+                    bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
+                    pc(this, msig.companion_dispatch, max, scaled.as_raw() as usize, at, count_buf, count_off);
+                    emit_uav_barrier(list, Some(&res_buf));
+                    bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
+                    pc(this, sig, max, scaled.as_raw() as usize, at + commands as u64, count_buf, count_off);
+                    emit_uav_barrier(list, Some(&res_buf));
+                    Ok(())
+                })();
+                emit_transition(list, &scaled, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+                passes
             })();
             match run {
                 Ok(()) => {
@@ -2142,5 +2210,43 @@ void main(uint t : SV_GroupIndex) {
         let Some((compute, mesh)) = scale_args(&commands, 3, 1000) else { return };
         assert_eq!(compute, [[1, 2, 1, 1], [2, 24, 1, 1], [3, 1000, 1, 1], [4, 0, 1, 1], [5, 1000, 1, 1]]);
         assert_eq!(mesh, [[1, 6, 1, 1], [2, 72, 1, 1], [3, 3000, 1, 1], [4, 0, 1, 1], [5, 3000, 1, 1]]);
+    }
+
+    #[test]
+    fn freed_two_pass_buffers_kept_for_reuse_are_capped() {
+        assert!(pool_keeps(0, 0, 128 << 20));
+        assert!(pool_keeps(1, 128 << 20, 128 << 20));
+        assert!(!pool_keeps(2, 256 << 20, 4 << 20));
+        assert!(!pool_keeps(16, 0, 1 << 20));
+    }
+
+    #[test]
+    fn gpu_two_pass_argument_scratch_is_shared_and_capped() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        let list = 0x7500_0001usize as *mut c_void;
+        unsafe {
+            // small rewrites share one block
+            let (a, at_a) = scratch_args(list, &dev, 100).unwrap();
+            let (b, at_b) = scratch_args(list, &dev, 300).unwrap();
+            assert_eq!((a.as_raw(), at_a), (b.as_raw(), 0));
+            assert_eq!(at_b, 256);
+            // a recording takes at most SCRATCH_CAP of blocks
+            let mut taken = 1;
+            while scratch_args(list, &dev, SCRATCH_BLOCK).is_ok() {
+                taken += 1;
+                assert!(taken <= SCRATCH_CAP / SCRATCH_BLOCK, "past the cap");
+            }
+            assert!(with(list, |s| s.scratch_taken) <= SCRATCH_CAP);
+            // the next recording starts again
+            reset(list, 0, 0);
+            assert!(scratch_args(list, &dev, SCRATCH_BLOCK).is_ok());
+        }
+        forget(list);
     }
 }
