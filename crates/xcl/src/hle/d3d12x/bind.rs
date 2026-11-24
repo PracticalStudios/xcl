@@ -356,11 +356,19 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
     res.ok_or_else(|| format!("null {what}"))
 }
 
-unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64), String> {
+/// Groups of a two-pass dispatch that have a record: one record a group in `cap_bytes` of
+/// records of `record_bytes`, and every group in X, the mesh pass's `split` times as many (at most
+/// 65 535 a dimension). The compute pass writes record `gid.x` with no bound of its own.
+fn record_groups(cap_bytes: u64, record_bytes: u64, split: u32) -> u32 {
+    (cap_bytes / record_bytes.max(1)).min(65_535 / split.max(1) as u64) as u32
+}
+
+/// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
+unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
-    if let Some((buf, _cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
+    if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
         let va = buf.GetGPUVirtualAddress();
-        return Ok((buf, va));
+        return Ok((buf, va, cap));
     }
     let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
     let dev_key = dev.as_raw() as usize;
@@ -372,14 +380,14 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
         Some(e) => e,
         None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
     };
-    let buf = entry.0.clone();
+    let (buf, cap) = (entry.0.clone(), entry.1);
     let va = buf.GetGPUVirtualAddress();
     with(this, |s| {
         if let Some(old) = s.res_buf.replace(entry) {
             s.res_retired.push(old);
         }
     });
-    Ok((buf, va))
+    Ok((buf, va, cap))
 }
 
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
@@ -450,48 +458,37 @@ unsafe fn bind_two_pass_stage(
     Ok(())
 }
 
+/// The pass that rewrites a two-pass ExecuteIndirect's arguments, on XCL's ABI: u0 = `count`,
+/// `stride`, `offset` (of the DispatchMesh argument), `split`, `cap` (groups with a record), and
+/// where the commands are (u2) and go (u3), in bytes. Each command goes out twice, for the compute
+/// pass and then (at `count · stride`) for the mesh pass, with at most `cap` groups.
+pub(super) const SCALE_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer src : register(u2);
+RWByteAddressBuffer dst : register(u3);
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    uint count = io.Load(0), stride = io.Load(4), offset = io.Load(8), split = io.Load(12), cap = io.Load(16);
+    if (tid >= count) return;
+    uint s = io.Load(20) + tid * stride, d = io.Load(24) + tid * stride, m = d + count * stride;
+    for (uint i = 0u; i < stride; i += 4u) {
+        uint w = src.Load(s + i);
+        dst.Store(d + i, w);
+        dst.Store(m + i, w);
+    }
+    uint n = min(src.Load(s + offset), cap);
+    dst.Store(d + offset, n);
+    dst.Store(m + offset, n * split);
+}
+"#;
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     let key = dev.as_raw() as usize;
     if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let hlsl = "cbuffer C : register(b0) { uint count; uint stride; uint offset; uint mult; };\nByteAddressBuffer src : register(t0);\nRWByteAddressBuffer dst : register(u0);\n[numthreads(64, 1, 1)]\nvoid main(uint tid : SV_DispatchThreadID) {\n    if (tid >= count) return;\n    uint base = tid * stride;\n    uint dwords = stride / 4u;\n    for (uint i = 0u; i < dwords; ++i) {\n        uint w = src.Load(base + i * 4u);\n        if (i * 4u == offset) w = w * mult;\n        dst.Store(base + i * 4u, w);\n    }\n}\n";
-    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
-    let params = [
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
-    ];
-    let desc = D3D12_ROOT_SIGNATURE_DESC {
-        NumParameters: params.len() as u32,
-        pParameters: params.as_ptr(),
-        ..Default::default()
-    };
-    let mut blob = None;
-    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).map_err(|e| format!("scale rs serialize: {e}"))?;
-    let blob = blob.ok_or("scale rs blob")?;
-    let rs: ID3D12RootSignature = dev
-        .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
-        .map_err(|e| format!("scale rs create: {e}"))?;
+    let dxil = crate::gpu::recomp::dxc::compile_cached(SCALE_ARGS_HLSL, "main", "cs_6_6")?.0;
+    let rs = crate::gpu::recomp::pso::abi_root_signature(dev, false)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
@@ -504,23 +501,31 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     Ok((rs, pso))
 }
 
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src_raw: usize, src_off: u64, max: u32, stride: u32, mesh_offset: u32, mult: u32) -> Result<ID3D12Resource, String> {
+/// The arguments of `max` commands at `src_off` in `src_raw`, rewritten for the two passes
+/// (`SCALE_ARGS_HLSL`): the buffer, with the compute pass's commands at 0 and the mesh pass's
+/// after them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src_raw: usize, src_off: u64, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<ID3D12Resource, String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let src_ptr = src_raw as *mut c_void;
     let src = ID3D12Resource::from_raw_borrowed(&src_ptr).ok_or("indirect args buffer")?;
-    let bytes = (max as u64).saturating_mul(stride as u64).max(256).next_multiple_of(256);
+    let bytes = (max as u64).saturating_mul(stride as u64).saturating_mul(2).max(256).next_multiple_of(256);
     let dst = default_uav_buffer(&dev, bytes, "scaled args buffer")?;
-    emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
+    let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    let consts = [max, stride, mesh_offset, mult];
-    list.SetComputeRoot32BitConstants(0, 4, consts.as_ptr() as *const c_void, 0);
-    list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress() + src_off);
-    list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
+    list.SetComputeRootUnorderedAccessView(0, consts_va);
+    list.SetComputeRootUnorderedAccessView(2, src.GetGPUVirtualAddress() + src_off);
+    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    emit_transition(list, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    emit_transition(list, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     let dev_key = dev.as_raw() as usize;
     with(this, |s| s.res_retired.push((dst.clone(), bytes, dev_key)));
     Ok(dst)
@@ -537,14 +542,25 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             return;
         }
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-        let need = (groups as u64).saturating_mul(tp.record.record_dwords() as u64).saturating_mul(4);
+        let record_bytes = tp.record.record_dwords() as u64 * 4;
+        let need = (groups as u64).saturating_mul(record_bytes);
         let run = (|| -> Result<(), String> {
-            let (res_buf, res_va) = ensure_res_buffer(this, need)?;
+            let (res_buf, res_va, cap) = ensure_res_buffer(this, need)?;
+            let n = groups.min(record_groups(cap, record_bytes, tp.mesh_groups_per_record));
+            if n == 0 {
+                return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
+            }
+            if n < groups {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - n);
+                }
+            }
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-            list.Dispatch(groups, 1, 1);
+            list.Dispatch(n, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-            pc_dm(this, groups.saturating_mul(tp.mesh_groups_per_record), 1, 1);
+            pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
             Ok(())
         })();
@@ -592,18 +608,23 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
-                let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
-                bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
-                emit_uav_barrier(list, Some(&res_buf));
-                if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
-                    let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
-                    bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off);
-                } else {
-                    bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, max, args, args_off, count_buf, count_off);
+                if max == 0 || args == 0 {
+                    return Ok(());
                 }
+                let record_bytes = tp.record.record_dwords() as u64 * 4;
+                let (res_buf, res_va, cap) = ensure_res_buffer(this, 32 << 20)?;
+                let cap = record_groups(cap, record_bytes, tp.mesh_groups_per_record);
+                if cap == 0 {
+                    return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
+                }
+                // the groups past the record buffer are dropped on the GPU (`SCALE_ARGS_HLSL`)
+                let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
+                let mesh_args = max as u64 * msig.byte_stride as u64;
+                bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
+                pc(this, msig.companion_dispatch, max, scaled.as_raw() as usize, 0, count_buf, count_off);
+                emit_uav_barrier(list, Some(&res_buf));
+                bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
+                pc(this, sig, max, scaled.as_raw() as usize, mesh_args, count_buf, count_off);
                 emit_uav_barrier(list, Some(&res_buf));
                 Ok(())
             })();
@@ -2069,5 +2090,42 @@ void main(uint t : SV_GroupIndex) {
         }
         let io = two_pass_io(None, &[], 0x4_1234_5600, true, base);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    #[test]
+    fn two_pass_groups_stay_inside_the_record_buffer() {
+        // #304's transform record: 11 908 dwords
+        let record = 11_908 * 4;
+        assert_eq!(record_groups(32 << 20, record, 1), 704);
+        assert_eq!(record_groups(128 << 20, record, 1), 2817);
+        // the mesh pass's groups, `split` a record, all in X
+        assert_eq!(record_groups(1 << 30, 64, 7), 65_535 / 7);
+        assert_eq!(record_groups(1 << 20, 2 << 20, 1), 0);
+    }
+
+    /// `SCALE_ARGS_HLSL` on `commands` (dwords each, the DispatchMesh argument at dword 1):
+    /// the compute pass's and the mesh pass's commands.
+    fn scale_args(commands: &[[u32; 4]], split: u32, cap: u32) -> Option<(Vec<[u32; 4]>, Vec<[u32; 4]>)> {
+        use crate::gpu::recomp::runner;
+        if runner::adapter().is_err() {
+            runner::skip_test("no GPU");
+            return None;
+        }
+        let dxil = crate::gpu::recomp::dxc::compile(SCALE_ARGS_HLSL, "main", "cs_6_6", &[]).unwrap();
+        let n = commands.len();
+        let (src, dst) = (0u32, 256u32);
+        let mut mem: Vec<u32> = commands.iter().flatten().copied().collect();
+        mem.resize(64 + 2 * 4 * n, 0xDEAD);
+        let io = [n as u32, 16, 4, split, cap, src, dst];
+        let out = runner::dispatch(&dxil, [(n as u32).div_ceil(64), 1, 1], &io, &mem).unwrap();
+        let cmd = |k: usize| [out[64 + 4 * k], out[65 + 4 * k], out[66 + 4 * k], out[67 + 4 * k]];
+        Some(((0..n).map(cmd).collect(), (n..2 * n).map(cmd).collect()))
+    }
+
+    #[test]
+    fn gpu_indirect_two_pass_groups_stay_inside_the_record_buffer() {
+        let Some((compute, mesh)) = scale_args(&[[7, 100, 1, 1], [8, 3, 1, 1], [9, 0, 1, 1]], 2, 10) else { return };
+        assert_eq!(compute, [[7, 10, 1, 1], [8, 3, 1, 1], [9, 0, 1, 1]]);
+        assert_eq!(mesh, [[7, 20, 1, 1], [8, 6, 1, 1], [9, 0, 1, 1]]);
     }
 }

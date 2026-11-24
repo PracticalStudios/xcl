@@ -1730,7 +1730,10 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        // every window (u2..u5) is `mem`, as in the heap above
+        for k in 2..6 {
+            list.SetComputeRootUnorderedAccessView(k, mem_buf.GetGPUVirtualAddress());
+        }
         let scratch = chain.map(|(_, words)| {
             let bytes = groups.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));
             buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
