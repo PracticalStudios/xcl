@@ -382,6 +382,26 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     Ok((buf, va))
 }
 
+/// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
+/// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
+/// write it (the translated pair picks each access's memory window from it).
+fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize) -> Vec<u32> {
+    let mut io = match layout {
+        Some(l) if compute_pass => console_list::user_data_ms(l, args, table_at),
+        Some(l) => console_list::user_data_gfx(l, args, table_at),
+        None if compute_pass => {
+            let mut v = vec![0u32; 16];
+            v[8] = table_at as u32;
+            v[9] = (table_at >> 32) as u32;
+            v
+        }
+        None => vec![table_at as u32, (table_at >> 32) as u32],
+    };
+    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
+    io
+}
+
 unsafe fn bind_two_pass_stage(
     this: *mut c_void,
     list: &ID3D12GraphicsCommandList,
@@ -404,18 +424,7 @@ unsafe fn bind_two_pass_stage(
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let mut io = match layout.as_ref() {
-        Some(l) if compute_pass => console_list::user_data_ms(l, &args, table_at as u64),
-        Some(l) => console_list::user_data_gfx(l, &args, table_at as u64),
-        None if compute_pass => {
-            let mut v = vec![0u32; 16];
-            v[8] = table_at as u32;
-            v[9] = (table_at >> 32) as u32;
-            v
-        }
-        None => vec![table_at as u32, (table_at >> 32) as u32],
-    };
-    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base());
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
@@ -2047,5 +2056,18 @@ void main(uint t : SV_GroupIndex) {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    #[test]
+    fn two_pass_io_carries_the_unified_memory_base() {
+        use crate::gpu::recomp::{IO_UMA_BASE_HI, KERNEL_SGPRS};
+        let base = 0x4_0000_0000usize;
+        for compute_pass in [true, false] {
+            let io = two_pass_io(None, &[], 0x4_1234_5600, compute_pass, base);
+            assert_eq!(io.len(), KERNEL_SGPRS);
+            assert_eq!(io[IO_UMA_BASE_HI], 4, "compute pass {compute_pass}");
+        }
+        let io = two_pass_io(None, &[], 0x4_1234_5600, true, base);
+        assert_eq!((io[8], io[9]), (0x1234_5600, 4));
     }
 }
