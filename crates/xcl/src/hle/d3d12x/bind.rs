@@ -555,13 +555,14 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
         return Ok(r);
     }
     let size = bytes.max(SCRATCH_BLOCK);
-    if with(this, |s| s.scratch_taken) + size > SCRATCH_CAP {
+    let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
+    if size > remaining {
         return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
     }
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= SCRATCH_CAP).map(|i| free.swap_remove(i))
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
     };
     let block = match picked {
         Some(e) => e,
@@ -2476,6 +2477,61 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             }
             super::super::list_x::bound_heaps(this, true);
             forget(this);
+        }
+    }
+
+
+    /// A reusable block must fit the recording's remaining budget, not just its request.
+    #[test]
+    fn gpu_two_pass_pooled_scratch_respects_remaining_budget() {
+        use windows::Win32::Graphics::{Direct3D::D3D_FEATURE_LEVEL_12_0, Dxgi::*};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+            let wanted = std::env::var("XCL_ADAPTER").unwrap_or_default();
+            let mut chosen = None;
+            for i in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+                let desc = adapter.GetDesc1().unwrap();
+                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..end]);
+                if !wanted.is_empty() && !name.contains(&wanted) { continue; }
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok() {
+                    chosen = Some((name, dev.unwrap()));
+                    break;
+                }
+            }
+            let Some((name, dev)) = chosen else {
+                crate::gpu::recomp::runner::skip_test("no selected D3D12 adapter");
+                return;
+            };
+            println!("POOLED_SCRATCH_ADAPTER={name}");
+            let key = dev.as_raw() as usize;
+            // These are state keys only; scratch_args does not call through a list pointer.
+            let (consumer, producer, empty) = (0x7500_1011usize as *mut c_void, 0x7500_1012usize as *mut c_void, 0x7500_1013usize as *mut c_void);
+            let allocator = 0x7500_1014usize;
+            let first = scratch_args(consumer, &dev, SCRATCH_BLOCK).unwrap();
+            assert_eq!(with(consumer, |s| s.scratch_taken), SCRATCH_BLOCK);
+            reset(producer, allocator, 0);
+            let large = scratch_args(producer, &dev, SCRATCH_CAP).unwrap();
+            assert_eq!(large.0.GetDesc().Width, SCRATCH_CAP);
+            reset(producer, 0, 0);
+            release_allocator_res(allocator);
+            let second = scratch_args(consumer, &dev, SCRATCH_BLOCK).unwrap();
+            let taken = with(consumer, |s| s.scratch_taken);
+            println!("POOLED_SCRATCH taken={taken} second_bytes={} cap={SCRATCH_CAP}", second.0.GetDesc().Width);
+            // If it was too large for consumer, the cached block remains reusable by an empty recording.
+            let reused = if taken <= SCRATCH_CAP {
+                let r = scratch_args(empty, &dev, SCRATCH_CAP).unwrap();
+                assert_eq!(r.0.as_raw(), large.0.as_raw());
+                assert_eq!(with(empty, |s| s.scratch_taken), SCRATCH_CAP);
+                assert!(scratch_args(empty, &dev, 256).is_err());
+                Some(r)
+            } else { None };
+            drop((first, second, large, reused));
+            for list in [consumer, producer, empty] { forget(list); }
+            FREE_RES.lock().unwrap().retain(|(_, _, d)| *d != key);
+            assert!(taken <= SCRATCH_CAP, "pooled block exceeds recording budget: {taken} > {SCRATCH_CAP}");
         }
     }
 }
