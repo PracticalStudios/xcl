@@ -445,6 +445,8 @@ unsafe fn bind_two_pass_stage(
     res_va: u64,
     compute_pass: bool,
 ) -> Result<(), String> {
+    // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
+    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -2404,6 +2406,76 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             }
             indirect.Unmap(0, None);
             out.Unmap(0, None);
+        }
+    }
+
+    /// With heap windows the two-pass programs read the memory windows from the shared heap
+    /// (`pso::mem_windows`): both passes' binds set it on a list that has none, as `bind_abi` does.
+    /// (Heap windows are opt-in: run with `XCL_HEAP_WINDOWS=1`, else skipped.)
+    #[test]
+    fn two_pass_binds_set_the_shared_view_heap() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        if !crate::gpu::recomp::pso::heap_windows() {
+            skip_test("no heap windows (opt-in: XCL_HEAP_WINDOWS=1)");
+            return;
+        }
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            calls: Mutex<Vec<Vec<usize>>>,
+        }
+        unsafe extern "system" fn fake_set_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+            let v = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+            (*(this as *const FakeList)).calls.lock().unwrap().push(v);
+        }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            // the shared heap with a window view, unless the backend made it already
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1 << 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut window: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut window).unwrap();
+            let window = window.unwrap();
+            if super::super::console_heap::global_heap().is_none() && !super::super::console_heap::set_window_views(&dev, &[(window.as_raw() as usize, 1 << 16)]) {
+                skip_test("no shared heap");
+                return;
+            }
+            let g = super::super::console_heap::global_heap().unwrap().as_raw() as usize;
+            let mut orig_vt = [0usize; 64];
+            orig_vt[28] = fake_set_heaps as usize;
+            let mut ext_vt = vec![0usize; 65];
+            ext_vt[0] = orig_vt.as_ptr() as usize;
+            ext_vt[1..].copy_from_slice(&orig_vt);
+            let fake = Box::new(FakeList { vt: ext_vt.as_ptr().add(1), calls: Mutex::new(Vec::new()) });
+            let this = &*fake as *const FakeList as *mut c_void;
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).unwrap();
+            // no root signatures: the bind stops before it records anything else
+            let tp = super::super::real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+            for compute_pass in [true, false] {
+                super::super::list_x::set_descriptor_heaps_x(this, 0, std::ptr::null());
+                assert!(super::super::list_x::bound_heaps(this, false).is_empty());
+                assert!(bind_two_pass_stage(this, list, 0, &tp, 0, compute_pass).is_err());
+                assert_eq!(super::super::list_x::bound_heaps(this, false), vec![g], "compute pass {compute_pass}: the shared heap is bound");
+                assert_eq!(fake.calls.lock().unwrap().last(), Some(&vec![g]), "compute pass {compute_pass}");
+            }
+            super::super::list_x::bound_heaps(this, true);
+            forget(this);
         }
     }
 }
